@@ -1,5 +1,6 @@
 import getpass
 import os
+from pydoc import plain
 
 from langchain.tools import tool
 from langchain.chat_models import init_chat_model
@@ -70,7 +71,7 @@ tools_by_name = {tool.name: tool for tool in tools}
 print("tools_by_name: ",tools_by_name)
 
 
-print(tools_by_name)
+# print(tools_by_name)
 
 model_with_tools = model.bind_tools(tools)
 
@@ -78,16 +79,28 @@ from langchain.messages import AnyMessage
 from typing_extensions import Annotated,TypedDict
 import operator
 
-class MessagesState(TypedDict):
-    """State of the messages."""
+
+# system state
+
+class ContextState(TypedDict):
+    """State of the whole context."""
+    goal: str
     messages: Annotated[list[AnyMessage], operator.add]
-    llm_calls: int
+    actions: Annotated[list[AnyMessage], operator.add]
+    observations: Annotated[list[AnyMessage], operator.add]
+    steps: int
+    plan: str
+    constrains: str
 
 
 from langchain.messages import SystemMessage
 
 def llm_call(state: dict):
     """LLM decides whether to call a toll or not"""
+
+
+    print("================================ llm_call =================================")
+    print("State: \n",state)
 
     return {
         "messages": [
@@ -98,26 +111,40 @@ def llm_call(state: dict):
                 + state["messages"]
                 )
         ],
-        "llm_calls": state.get("llm_calls", 0) + 1,
+        "steps": state.get("steps", 0) + 1,
     }
 
 from langchain.messages import ToolMessage
 
 def tool_node(state: dict):
     """Perform the tool call"""
-    
-    result = []
+    print("================================ tool_node =================================")
+    print("State: \n",state)
+
+    actions = []
+    observations = []
+    messages = []
     for tool_call in state["messages"][-1].tool_calls:
         tool = tools_by_name[tool_call["name"]]
         observation = tool.invoke(tool_call["args"])
-        result.append(
+        observations.append(
             ToolMessage(
                 content=observation,
                 tool_call_id=tool_call["id"],
             )
         )
+        messages.append(
+            ToolMessage(
+                content=observation,
+                tool_call_id=tool_call["id"],
+            )
+        )
+        actions.append(tool_call["name"])
     return {
-        "messages": result,
+        "actions": actions,
+        "observations": observations,
+        "messages": messages,
+        "steps": state.get("steps", 0) + 1,
     }
 
 
@@ -135,7 +162,7 @@ def should_continue(state: dict) -> Literal["tool_node", END]:
 
 
 # define the graph
-cowoker_builder = StateGraph(MessagesState)
+cowoker_builder = StateGraph(ContextState)
 
 
 # add the nodes to the graph
@@ -161,11 +188,11 @@ Image(agent.get_graph().draw_mermaid_png())
 
 # invoke
 from langchain.messages import HumanMessage
-messages = [HumanMessage(content="Add 2 and 3")]
+messages = [HumanMessage(content="Add 2128934.5 and 38923 and then multiply the result by -49.1 and then subtract -519241.7 and then divide the result by 2.3")]
 messages = agent.invoke({"messages": messages})
 
 # print messages for debugging
-print("messages: ",messages)
+# print("messages: ",messages)
 
 for message in messages["messages"]:
     message.pretty_print()
