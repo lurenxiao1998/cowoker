@@ -2,6 +2,8 @@ import getpass
 import os
 import re
 import pprint
+import re
+import pprint
 import subprocess
 from pathlib import Path
 from typing import Literal, Optional
@@ -15,6 +17,11 @@ import operator
 from langgraph.graph import StateGraph, START, END
 
 
+MAX_TEST_FAILURES = 3
+
+MAX_STEPS = 20
+
+MAX_CONTEXT_CHARS = 200000 
 MAX_TEST_FAILURES = 3
 
 MAX_STEPS = 20
@@ -63,6 +70,12 @@ def _read_text(p: Path, max_chars: int = 12000) -> str:
         tail = data[-max_chars // 2 :]
         return head + "\n\n...<TRUNCATED>...\n\n" + tail
     return data
+
+
+def _extract_exit_code(run_cmd_output: str) -> Optional[int]:
+    # output starts with: exit_code=123
+    m = re.search(r"exit_code=(\-?\d+)", run_cmd_output)
+    return int(m.group(1)) if m else None
 
 
 def _extract_exit_code(run_cmd_output: str) -> Optional[int]:
@@ -131,9 +144,22 @@ def ask_user(prompt: str) -> str:
 
 
 tools = [list_files, read_file, write_file, run_cmd, ask_user]
+@tool
+def ask_user(prompt: str) -> str:
+    """Ask the user for input during agent run."""
+    return input(prompt)
+
+
+tools = [list_files, read_file, write_file, run_cmd, ask_user]
 tools_by_name = {t.name: t for t in tools}
 
 model_with_tools = model.bind_tools(tools)
+
+
+def _extract_exit_code(run_cmd_output: str) -> Optional[int]:
+    # output starts with: exit_code=123
+    m = re.search(r"exit_code=(\-?\d+)", run_cmd_output)
+    return int(m.group(1)) if m else None
 
 
 def _extract_exit_code(run_cmd_output: str) -> Optional[int]:
@@ -162,6 +188,7 @@ class ContextState(TypedDict):
     # plan: str
     # constraints: str
     done_criteria: list[str]
+    done_criteria: list[str]
 
     # loop control
     steps: int
@@ -171,6 +198,12 @@ class ContextState(TypedDict):
     # core traces
     messages: Annotated[list[AnyMessage], operator.add]
     # actions: Annotated[list[ActionRecord], operator.add]
+    observations: Annotated[list[ObservationRecord], operator.add]
+
+    test_cmd: str
+    last_test: dict  # {"cmd": str, "exit_code": int, "output": str}
+    test_failures: int
+    verdict: str     # "running" | "need_evidence" | "retry" | "success" | "fail"
     observations: Annotated[list[ObservationRecord], operator.add]
 
     test_cmd: str
@@ -192,6 +225,7 @@ Rules:
 - When you change code, use write_file.
 - Validate with run_cmd (e.g., run tests) when appropriate.
 - If user intent or required inputs are unclear, call ask_user to clarify.
+- If user intent or required inputs are unclear, call ask_user to clarify.
 - Keep changes minimal and respect constraints.
 - Be explicit about next actions via tool calls rather than long explanations.
 - Stop when done_criteria are satisfied; then summarize changes briefly.
@@ -206,12 +240,10 @@ You must not invent file contents. Always read files you need via tools.
 def llm_call(state: dict):
     """LLM decides next step and may call tools."""
     if state.get("steps", 0) >= MAX_STEPS:
-        # return {"status": "fail", "last_error": f"Reached MAX_STEPS={MAX_STEPS}"}
         return {"messages": [SystemMessage(content=f"Reached MAX_STEPS={MAX_STEPS}")]}
 
     total_chars = sum(len(msg.content) for msg in state["messages"])
     if total_chars > MAX_CONTEXT_CHARS:
-        # return {"status": "fail", "last_error": f"Context overflow! Total chars: {total_chars} > {MAX_CONTEXT_CHARS}. Please implement context compression"}
         return {"messages": [SystemMessage(content=f"Context overflow! Total chars: {total_chars} > {MAX_CONTEXT_CHARS}. Please implement context compression")]}
 
     # 给模型一段简短 task header（结构化 state -> prompt 视图）
@@ -226,9 +258,14 @@ def llm_call(state: dict):
     if state.get("verdict") == "need_evidence":
         cmd = state.get("test_cmd") or "pytest -q"
         extra = [SystemMessage(content=f"Evidence missing: you must run tests now using run_cmd(cmd='{cmd}'). If it fails, inspect failures and fix minimally.")]
+    extra=[]
+    if state.get("verdict") == "need_evidence":
+        cmd = state.get("test_cmd") or "pytest -q"
+        extra = [SystemMessage(content=f"Evidence missing: you must run tests now using run_cmd(cmd='{cmd}'). If it fails, inspect failures and fix minimally.")]
 
     msg = model_with_tools.invoke(
         [SystemMessage(content=CODING_SYSTEM_PROMPT)]
+        + extra
         + extra
         + state["messages"]
     )
@@ -310,7 +347,9 @@ builder = StateGraph(ContextState)
 builder.add_node("llm_call", llm_call)
 builder.add_node("tool_node", tool_node)
 builder.add_node("judge_node", judge_node)
+builder.add_node("judge_node", judge_node)
 builder.add_edge(START, "llm_call")
+builder.add_conditional_edges("llm_call", route_after_llm, ["tool_node", "judge_node"])
 builder.add_conditional_edges("llm_call", route_after_llm, ["tool_node", "judge_node"])
 builder.add_edge("tool_node", "llm_call")
 builder.add_conditional_edges("judge_node", route_after_judge, ["llm_call",END])
@@ -332,6 +371,7 @@ if __name__ == "__main__":
         # "plan": "1) list files 2) find test command 3) run tests 4) fix minimal issue if needed 5) re-run relevant tests",
         # "constraints": constraints,
         "done_criteria": done_criteria,
+        "done_criteria": done_criteria,
         "steps": 0,
         # "status": "running",
         # "last_error": "",
@@ -344,9 +384,35 @@ if __name__ == "__main__":
         "last_test": None,
         "test_failures": 0,
         "verdict": "running",
+
+        "test_cmd": "pytest -q",
+        "last_test": None,
+        "test_failures": 0,
+        "verdict": "running",
     }
 
     out = agent.invoke(init_state)
+    # write messages to file for debugging (human-readable)
+    with open("messages.txt", "w") as f:
+        for m in out["messages"]:
+            msg_type = getattr(m, "type", m.__class__.__name__)
+            name = getattr(m, "name", None)
+            tool_call_id = getattr(m, "tool_call_id", None)
+            tool_calls = getattr(m, "tool_calls", None)
+            additional_kwargs = getattr(m, "additional_kwargs", None)
+            header_parts = [msg_type]
+            if name:
+                header_parts.append(f"name={name}")
+            if tool_call_id:
+                header_parts.append(f"tool_call_id={tool_call_id}")
+            f.write("[" + " ".join(header_parts) + "]\n")
+            f.write((getattr(m, "content", str(m)) or "").rstrip() + "\n\n")
+            if tool_calls:
+                f.write("TOOL_CALLS:\n")
+                f.write(pprint.pformat(tool_calls, width=100).rstrip() + "\n\n")
+            if additional_kwargs:
+                f.write("ADDITIONAL_KWARGS:\n")
+                f.write(pprint.pformat(additional_kwargs, width=100).rstrip() + "\n\n")
     # write messages to file for debugging (human-readable)
     with open("messages.txt", "w") as f:
         for m in out["messages"]:
