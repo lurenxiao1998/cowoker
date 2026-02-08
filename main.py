@@ -233,7 +233,7 @@ class ContextState(__import__('typing').TypedDict):
     focus_files: list[str]
 
 
-MAX_STEPS = 20
+MAX_STEPS = 50
 
 
 # =========================

@@ -1,2 +1,5 @@
 .venv/
 messages.txt
+test.json
+__pycache__/
+*.pyc
