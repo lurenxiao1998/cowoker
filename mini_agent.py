@@ -10,8 +10,9 @@ from langchain.messages import AnyMessage, SystemMessage, HumanMessage, ToolMess
 
 from typing_extensions import Annotated, TypedDict
 import operator
-
+import json
 from langgraph.graph import StateGraph, START, END
+
 
 
 # =========================
@@ -80,7 +81,7 @@ def read_file(path: str) -> str:
     """Read a text file under repo root. Returns (possibly truncated) content."""
     p = _safe_path(path)
     if not p.exists() or not p.is_file():
-        raise FileNotFoundError(f"Not a file: {path}")
+        return f"NOT_FOUND: {path} (file does not exist under repo root)"
     return _read_text(p)
 
 
@@ -133,23 +134,23 @@ class ObservationRecord(TypedDict):
 
 class ContextState(TypedDict):
     # task control
-    goal: str
-    plan: str
-    constraints: str
-    done_criteria: list[str]
+    # goal: str
+    # plan: str
+    # constraints: str
+    # done_criteria: list[str]
 
     # loop control
     steps: int
-    status: str  # running | success | fail
-    last_error: str
+    # status: str  # running | success | fail
+    # last_error: str
 
     # core traces
     messages: Annotated[list[AnyMessage], operator.add]
-    actions: Annotated[list[ActionRecord], operator.add]
-    observations: Annotated[list[ObservationRecord], operator.add]
+    # actions: Annotated[list[ActionRecord], operator.add]
+    # observations: Annotated[list[ObservationRecord], operator.add]
 
     # optional workspace hints
-    focus_files: list[str]
+    # focus_files: list[str]
 
 
 MAX_STEPS = 20
@@ -171,29 +172,38 @@ Rules:
 You must not invent file contents. Always read files you need via tools.
 """
 
-
+# 估算值：1 token ≈ 4 chars
+# 128k context ≈ 500,000 chars
+# 为了避免上下文过长导致超时和天价账单，添加熔断机制
+# 安全起见，设置阈值为 200,000 chars (约 50k tokens)
+MAX_CONTEXT_CHARS = 200000 
 def llm_call(state: dict):
     """LLM decides next step and may call tools."""
     if state.get("steps", 0) >= MAX_STEPS:
         return {"status": "fail", "last_error": f"Reached MAX_STEPS={MAX_STEPS}"}
 
+    total_chars = sum(len(msg.content) for msg in state["messages"])
+    if total_chars > MAX_CONTEXT_CHARS:
+        return {"status": "fail", "last_error": f"Context overflow! Total chars: {total_chars} > {MAX_CONTEXT_CHARS}. Please implement context compression"}
+
     # 给模型一段简短 task header（结构化 state -> prompt 视图）
-    header = f"""GOAL: {state.get('goal','')}
-CONSTRAINTS: {state.get('constraints','')}
-DONE_CRITERIA: {state.get('done_criteria', [])}
-CURRENT_PLAN: {state.get('plan','')}
-FOCUS_FILES: {state.get('focus_files', [])}
-"""
+#     header = f"""GOAL: {state.get('goal','')}
+# CONSTRAINTS: {state.get('constraints','')}
+# DONE_CRITERIA: {state.get('done_criteria', [])}
+# CURRENT_PLAN: {state.get('plan','')}
+# FOCUS_FILES: {state.get('focus_files', [])}
+# """
+
 
     msg = model_with_tools.invoke(
-        [SystemMessage(content=CODING_SYSTEM_PROMPT), SystemMessage(content=header)]
+        [SystemMessage(content=CODING_SYSTEM_PROMPT)]
         + state["messages"]
     )
 
     return {
         "messages": [msg],
         "steps": state.get("steps", 0) + 1,
-        "status": state.get("status", "running"),
+        # "status": state.get("status", "running"),
     }
 
 
@@ -218,17 +228,17 @@ def tool_node(state: dict):
 
     return {
         "messages": out_messages,
-        "actions": actions,
-        "observations": observations,
-        "steps": state.get("steps", 0) + 1,
+        # "actions": actions,
+        # "observations": observations,
+        # "steps": state.get("steps", 0) + 1,
     }
 
 
 def should_continue(state: dict) -> Literal["tool_node", END]:
     """Continue if LLM requested tools, else stop."""
     # 如果上一步已经 fail/success，就停
-    if state.get("status") in ("success", "fail"):
-        return END
+    # if state.get("status") in ("success", "fail"):
+    #     return END
     if not state.get("messages"):
         return END
     last = state["messages"][-1]
@@ -262,29 +272,32 @@ if __name__ == "__main__":
     done_criteria = ["Explain how to run tests", "If you made changes, tests should pass for the changed area"]
 
     init_state: ContextState = {
-        "goal": goal,
-        "plan": "1) list files 2) find test command 3) run tests 4) fix minimal issue if needed 5) re-run relevant tests",
-        "constraints": constraints,
-        "done_criteria": done_criteria,
+        # "goal": goal,
+        # "plan": "1) list files 2) find test command 3) run tests 4) fix minimal issue if needed 5) re-run relevant tests",
+        # "constraints": constraints,
+        # "done_criteria": done_criteria,
         "steps": 0,
-        "status": "running",
-        "last_error": "",
+        # "status": "running",
+        # "last_error": "",
         "messages": [HumanMessage(content=goal)],
-        "actions": [],
-        "observations": [],
-        "focus_files": [],
+        # "actions": [],
+        # "observations": [],
+        # "focus_files": [],
     }
 
     out = agent.invoke(init_state)
+    # write messages to file for debugging
+    with open("messages.json", "w") as f:
+        json.dump(out["messages"], f)
 
     print("\n===================== FINAL MESSAGES =====================")
     for m in out["messages"]:
         m.pretty_print()
 
-    print("\n===================== ACTIONS (structured) =====================")
-    for a in out.get("actions", []):
-        print(a)
+    # print("\n===================== ACTIONS (structured) =====================")
+    # for a in out.get("actions", []):
+    #     print(a)
 
-    print("\n===================== OBSERVATIONS (structured) =====================")
-    for o in out.get("observations", []):
-        print({"tool_call_id": o["tool_call_id"], "output_head": o["output"][:200].replace("\n", "\\n")})
+    # print("\n===================== OBSERVATIONS (structured) =====================")
+    # for o in out.get("observations", []):
+    #     print({"tool_call_id": o["tool_call_id"], "output_head": o["output"][:200].replace("\n", "\\n")})
